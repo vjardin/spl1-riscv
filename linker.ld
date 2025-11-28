@@ -1,27 +1,39 @@
 ENTRY(_start);
 
-/* QEMU virt: place firmware at 0x80000000 */
-MEMORY {
-    ROM (rx)  : ORIGIN = 0x80000000, LENGTH = 256K
-    RAM (rwx) : ORIGIN = 0x80040000, LENGTH = 256K
+/* QEMU virt memory map for XIP from NOR flash
+ *
+ *  - FLASH: CFI pflash0 at 0x2000_0000, 32 MiB
+ *  - RAM  : DRAM at 0x8000_0000 (we use 1 MiB for SPL stack/BSS)
+ */
+
+MEMORY
+{
+    FLASH (rx)  : ORIGIN = 0x20000000, LENGTH = 32M
+    RAM   (rwx) : ORIGIN = 0x80000000, LENGTH = 1M
 }
 
-SECTIONS {
-    .text : {
-        KEEP(*(.text.init))     /* <- ensure _start is first */
+SECTIONS
+{
+    /* SPL code and rodata live in flash (XIP) */
+    .text : ALIGN(4)
+    {
+        KEEP(*(.text.init))     /* our _start stub */
         *(.text*)
         *(.rodata*)
-    } > ROM
+    } > FLASH
 
-    .bss (NOLOAD) : {
+    /* BSS in RAM */
+    .bss (NOLOAD) : ALIGN(4)
+    {
         __bss_start = .;
         *(.bss*)
         *(COMMON)
         __bss_end = .;
     } > RAM
 
-    .stack (NOLOAD) : {
-        . = ALIGN(16);
-        _stack_top = . + 0x4000; /* 16 KiB stack */
+    /* Stack: just define a symbol at top of our 1 MiB RAM */
+    .stack (NOLOAD) : ALIGN(16)
+    {
+        _stack_top = ORIGIN(RAM) + LENGTH(RAM);
     } > RAM
 }
