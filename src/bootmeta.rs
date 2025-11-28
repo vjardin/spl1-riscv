@@ -1,12 +1,24 @@
 use core::result::Result;
 use crate::flash_intel::{FlashError, IntelFlash};
+use crate::slog; // slog! macro
 
+/// Which bank we booted from / are about to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootBank {
     A,
     B,
 }
 
+/// Simple append-only log of boot attempts, stored in NOR flash.
+///
+/// Layout in the metadata region:
+///   - each entry is a 32-bit word
+///   - 0xFFFF_FFFF = erased/unused
+///   - 0x1111_1111 = "booted bank A"
+///   - 0x0000_0000 = "booted bank B"
+///
+/// The log grows by appending words; compaction is theoretically
+/// supported but depends on block_erase() being implemented.
 pub struct BootMeta<'a> {
     flash: &'a IntelFlash,
     meta_offset: usize,
@@ -49,7 +61,10 @@ impl<'a> BootMeta<'a> {
         self.flash.program(self.word_offset(idx), &bytes)
     }
 
-    /// Scan log: returns (a_count, b_count, next_free_index).
+    /// Scan the metadata area and count how many times each bank appears,
+    /// and where the next free entry is.
+    ///
+    /// Returns: (a_count, b_count, next_free_index)
     pub fn scan(&self) -> (u32, u32, usize) {
         let mut a_count = 0u32;
         let mut b_count = 0u32;
@@ -65,6 +80,7 @@ impl<'a> BootMeta<'a> {
             } else if w == Self::TOKEN_BANK_B {
                 b_count += 1;
             } else {
+                // Unknown value, stop scanning to be conservative.
                 break;
             }
             idx += 1;
@@ -73,6 +89,11 @@ impl<'a> BootMeta<'a> {
         (a_count, b_count, idx)
     }
 
+    /// Compact the log by erasing the whole block and rewriting only the
+    /// effective counts.
+    ///
+    /// For real NOR, let's use working block_erase(); in QEMU the
+    /// current flash_intel::block_erase() is a stub and this will error.
     fn compact(
         &self,
         mut a_count: u32,
@@ -80,8 +101,7 @@ impl<'a> BootMeta<'a> {
     ) -> Result<(), FlashError> {
         let block_index = self.meta_offset / self.flash.block_size;
 
-        // In our QEMU setup, we don't expect to hit compaction in practice.
-        // This will just return an error if ever called.
+        slog!("compact: erasing block index {}", block_index);
         self.flash.block_erase(block_index)?;
 
         let mut idx = 0usize;
@@ -101,14 +121,29 @@ impl<'a> BootMeta<'a> {
         Ok(())
     }
 
+    /// Record a boot attempt for the given bank.
+    ///
+    /// The runtime decision to *call* this (or not) is made in spl_main
+    /// via should_record_boot(), so this function always assumes "writes allowed".
     pub fn record_boot(&self, bank: BootBank) -> Result<(), FlashError> {
         let (a_count, b_count, mut next_idx) = self.scan();
         let cap = self.words_capacity();
 
+        slog!(
+            "record_boot: start (bank={:?}, a_count={}, b_count={}, next_idx={}, cap={})",
+            bank,
+            a_count,
+            b_count,
+            next_idx,
+            cap
+        );
+
         if next_idx >= cap {
+            slog!("record_boot: log full, compacting");
             self.compact(a_count, b_count)?;
             let (_a2, _b2, idx2) = self.scan();
             next_idx = idx2;
+            slog!("record_boot: after compact scan: next_idx={}", next_idx);
         }
 
         let token = match bank {
@@ -116,9 +151,18 @@ impl<'a> BootMeta<'a> {
             BootBank::B => Self::TOKEN_BANK_B,
         };
 
+        slog!(
+            "record_boot: writing token 0x{:08x} at word index {} (offset=0x{:x})",
+            token,
+            next_idx,
+            self.word_offset(next_idx),
+        );
+
         self.write_word(next_idx, token)
     }
 
+    /// Pick which bank to boot next (A/B) based on how many trials each
+    /// already has.
     pub fn choose_bank(&self, max_trials: u32) -> BootBank {
         let (a_count, b_count, _idx) = self.scan();
 
@@ -127,6 +171,7 @@ impl<'a> BootMeta<'a> {
         } else if a_count < max_trials {
             BootBank::A
         } else {
+            // Both reached max_trials, fall back to B by convention.
             BootBank::B
         }
     }
